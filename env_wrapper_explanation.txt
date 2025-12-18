@@ -1,0 +1,535 @@
+============================================================
+ENV_WRAPPERS.PY – DETAILED EXPLANATION
+============================================================
+
+This file builds a “pipeline” of wrappers around the base GymDSSAT-PDI
+environment so that it becomes suitable and convenient for RL algorithms
+like DQN, PPO, or DDPG.
+
+The final environment returned by make_env(...) looks like this:
+
+    NormalizationWrapper(
+      ActionToDictWrapper(
+        RewardTupleAdapter(
+          DictToArrayWrapper(
+            TimeLimit(
+              GymDssatPdi-v0
+            )
+          )
+        )
+      )
+    )
+
+Data flows like this:
+
+  - OBSERVATION: base env (dict) → DictToArrayWrapper (1D vector) → NormalizationWrapper (normalized vector)
+  - ACTION: RL agent (Discrete int) → ActionToDictWrapper (dict {anfer, amir}) → base env
+  - REWARD: base env (main, leach) or main only → RewardTupleAdapter (main only, leach in info) → NormalizationWrapper (normalized main)
+
+Below is a wrapper-by-wrapper explanation.
+
+============================================================
+1. DictToArrayWrapper
+============================================================
+
+WHAT PROBLEM IT SOLVES
+----------------------
+GymDSSAT returns observations as a dictionary, e.g.:
+
+    {
+      "dap": 45,
+      "tmax": 31.0,
+      "sw": [...],
+      ...
+    }
+
+But most RL libraries (including Stable-Baselines3) prefer that the
+observation is a single NumPy vector (Box space), not a dict.
+
+So we need to:
+  - choose which keys we care about,
+  - flatten them into a single 1D float32 vector, and
+  - keep the ordering consistent every step.
+
+That’s exactly what DictToArrayWrapper does.
+
+KEY IDEAS
+---------
+- It takes a dict observation and turns it into a single vector.
+- It works with a fixed key order given by OBS_SCALAR_KEYS.
+- If a key is missing from the obs, it uses a zero vector for that key.
+- If obs is None (e.g., terminal obs), it returns a full zero vector.
+
+HOW IT WORKS (STEP BY STEP)
+---------------------------
+1) In __init__:
+   - self.key_order = list(key_order)
+     This is the order in which keys will be read and concatenated.
+
+   - self._sizes = {k: int(np.prod(env.observation_space.spaces[k].shape)) ...}
+     For each key, we ask the original env’s observation space:
+       - If the key’s space shape is (), np.prod(()) = 1  → a scalar
+       - If the shape is (9,), np.prod((9,)) = 9         → a 9-element vector
+     So _sizes["dap"] = 1, _sizes["sw"] = 9, etc.
+
+   - total = sum(self._sizes.values())
+     This is the total length of the final flat vector.
+
+   - self.observation_space = Box(low=-inf, high=inf, shape=(total,), dtype=float32)
+     This declares to Gym and RL libs that this wrapper’s observations
+     are 1D vectors of length = total.
+
+   - self._zeros = {k: np.zeros(self._sizes[k], dtype=np.float32) ...}
+     For each key, we prepare a zero vector of the right length, used
+     later when the actual observation dict doesn’t contain that key
+     or when obs is None.
+
+2) In observation(self, obs):
+   - If obs is None (some envs do this on terminal step):
+       Return a concatenation of zeros for all keys.
+
+   - Otherwise:
+       Create an empty list 'parts'.
+       For each key k in self.key_order:
+         - If k exists in obs: use obs[k]
+         - Else: use self._zeros[k]
+         - Convert to np.float32, flatten to 1D with reshape(-1),
+           and append to 'parts'.
+       Finally: return np.concatenate(parts, axis=0)
+
+END RESULT
+----------
+Downstream code (RewardTupleAdapter, NormalizationWrapper, RL algorithms)
+will always see the observation as a flat 1D vector (Box space), not a dict.
+
+============================================================
+2. ActionToDictWrapper
+============================================================
+
+WHAT PROBLEM IT SOLVES
+----------------------
+GymDSSAT expects actions in this form:
+
+    {"anfer": some_fertilizer_amount, "amir": some_irrigation_amount}
+
+But many RL algorithms (especially DQN-style) are easiest to use with
+a Discrete action space (0, 1, 2, ..., N-1).
+
+We want:
+  - The agent to choose a single integer in Discrete(25),
+  - That integer to map to a pair (anfer, amir) from fixed sets.
+
+NITROGEN_ACTIONS = (0, 40, 80, 120, 160)
+IRRIGATION_ACTIONS = (0, 6, 12, 18, 24)
+
+This gives a 5 x 5 grid = 25 combinations.
+
+For example:
+  action = 7  → maybe (40 N, 12 W), depending on row/col.
+
+HOW IT WORKS
+------------
+1) In __init__:
+   - self.anfer_values = array(NITROGEN_ACTIONS)
+   - self.amir_values  = array(IRRIGATION_ACTIONS)
+   - self._m = len(self.amir_values)  # = 5
+   - self.action_space = Discrete(len(anfer_values) * len(amir_values)) = Discrete(25)
+
+   So the "visible" action_space to the agent becomes Discrete(25).
+
+2) In action(self, action):
+   - First, convert the action to a Python int:
+       a = int(np.asarray(action).item())
+   - Compute row and column:
+       i = a // self._m  (integer division)
+       j = a %  self._m  (remainder)
+   - Pick values:
+       anfer = self.anfer_values[i]
+       amir  = self.amir_values[j]
+   - Return:
+       {"anfer": float(anfer), "amir": float(amir)}
+
+END RESULT
+----------
+The RL agent picks an integer 0–24, and the wrapper converts it into
+the dictionary form that GymDSSAT expects as its action format.
+
+============================================================
+3. RewardTupleAdapter
+============================================================
+
+WHAT PROBLEM IT SOLVES
+----------------------
+You changed the environment so that it returns reward as a tuple:
+
+    (main_reward, leach_reward)
+
+But RL algorithms expect a single scalar reward.
+
+You ALSO want to:
+  - Monitor leaching separately (e.g., log it in TensorBoard),
+  - Track how much nitrogen and water were applied in the episode,
+  - Track final yield at the end of the episode.
+
+RewardTupleAdapter solves all of that.
+
+WHAT IT DOES
+------------
+At each step:
+  - Reads the action dict to accumulate total N and W applied.
+  - Splits the reward:
+      main → used as the training reward
+      leach → put into info['leach']
+  - Accumulates total leach over the episode.
+  - Keeps track of yield (from the observation vector) across steps.
+  - On done=True, adds a summary dictionary 'episode_metrics' into info.
+
+IN DETAIL
+---------
+1) In __init__:
+   - self._yield_index = 4
+     This means we expect the yield (e.g., 'grnwt') to be at index 4
+     of the flat observation vector. This matches the order of your
+     OBS_SCALAR_KEYS if "grnwt" is the 5th entry.
+
+   - self._reset_stats()
+     Initializes counters:
+       _N_total = 0.0
+       _W_total = 0.0
+       _leach_total = 0.0
+       _yield_final = None
+
+   - self._yield_from_prev = None
+     Will store the yield value from the previous observation, used to
+     report final yield at the moment just before terminal step.
+
+2) In _reset_stats():
+   Just zeroes out the counts at the start of each episode.
+
+3) In reset(self, **kwargs):
+   - Calls obs = self.env.reset(**kwargs)
+   - Calls self._reset_stats()
+   - Converts obs to a 1D array:
+       arr = np.asarray(obs).reshape(-1)
+   - If arr is long enough, store:
+       self._yield_from_prev = float(arr[self._yield_index])
+   - Returns the original obs (unchanged).
+
+4) In step(self, action):
+   - First, accumulate N and W from the action dict:
+       self._N_total += float(action.get('anfer', 0.0))
+       self._W_total += float(action.get('amir', 0.0))
+
+   - Store yield_before = self._yield_from_prev
+     This is the yield “just before” we step.
+
+   - Call the underlying env:
+       obs, rew, done, info = self.env.step(action)
+
+   - Handle reward:
+       If rew is a tuple/list of length >= 2:
+         main_rew, leach_val = rew[0], rew[1]
+         rew = float(main_rew)
+       Else:
+         rew = float(rew)
+         leach_val stays None
+
+       If leach_val is still None:
+         - Try to get it from info.get('leach', 0.0)
+       Set info['leach'] = leach_val (ensures it always exists).
+       Add to total:
+         self._leach_total += leach_val
+
+   - Update yield buffer:
+       If obs is not None:
+         arr = np.asarray(obs, dtype=np.float32).reshape(-1)
+         If arr has index yield_index:
+           self._yield_from_prev = float(arr[self._yield_index])
+
+   - If done is True:
+       yfinal = yield_before if not None else NaN
+       info['episode_metrics'] = {
+         "N_total":     self._N_total,
+         "W_total":     self._W_total,
+         "leach_total": self._leach_total,
+         "yield":       yfinal,
+       }
+
+   - Return obs, rew, done, info
+     Note: Now rew is just the main scalar reward.
+
+END RESULT
+----------
+The agent:
+  - Sees only the main scalar reward,
+  - Can still access leach via info['leach'],
+  - At the end of every episode, info['episode_metrics'] contains:
+      total N, total W, total leach, and final yield.
+
+This is ideal for logging and analysis.
+
+============================================================
+4. RunningMeanStd
+============================================================
+
+WHAT PROBLEM IT SOLVES
+----------------------
+For normalization (both observations and rewards), you need to keep
+track of running mean and variance in a numerically stable way.
+
+You cannot just keep all data in memory (too big), so you update
+statistics incrementally.
+
+RunningMeanStd is a small utility class that does exactly that.
+
+WHAT IT DOES
+------------
+- Holds:
+    self.mean : float or array
+    self.var  : float or array
+    self.count: scalar, number of samples so far
+
+- Supports:
+    update(x): incorporate a batch of data into the statistics
+    state_dict(), load_state_dict(): save / load to/from JSON-friendly format
+
+IN DETAIL
+---------
+1) __init__(shape, epsilon=1e-8):
+   - mean = zeros(shape)
+   - var = ones(shape)
+   - count = epsilon (to avoid division by zero)
+   - epsilon saved as attribute
+
+2) update(x):
+   - Convert x to np.float32 array.
+   - If x.ndim == mean.ndim, we add a batch dimension:
+       x = x[None, ...]
+     Example:
+       mean has shape (25,)
+       A single obs x also has shape (25,)
+       We convert it to (1, 25) so we can take batch mean/var over axis=0.
+
+   - Compute:
+       batch_mean = mean(x, axis=0)
+       batch_var  = var(x, axis=0)
+       batch_count = x.shape[0]
+
+   - Call _update_from_moments(batch_mean, batch_var, batch_count)
+
+3) _update_from_moments(batch_mean, batch_var, batch_count):
+   - This uses standard numerically stable formulas for combining:
+       old mean/var/count with batch mean/var/count.
+   - Updates:
+       self.mean, self.var, self.count
+
+4) state_dict() / load_state_dict():
+   - Used by NormalizationWrapper.save()/.load()
+   - Converts arrays to lists so they can be dumped to JSON.
+
+END RESULT
+----------
+This class abstracts all the messy math for “running mean and variance”
+for both observations and returns.
+
+============================================================
+5. NormalizationWrapper
+============================================================
+
+WHAT PROBLEM IT SOLVES
+----------------------
+RL training is often more stable when:
+
+  - Observations are normalized → mean ~ 0, std ~ 1
+  - Rewards are normalized → scaled to a reasonable magnitude
+
+However, you don’t know the true mean and variance in advance, so you
+estimate them online, as training progresses.
+
+NormalizationWrapper wraps an env and takes care of:
+  - Updating and applying observation normalization
+  - Updating and applying reward normalization based on running returns
+  - Keeping track of raw (unnormalized) rewards for logging
+
+KEY IDEAS
+---------
+- Observation normalization:
+    obs_norm = (obs - obs_mean) / sqrt(obs_var + eps)
+- Reward normalization:
+    Uses *discounted return* self._ret to track reward scale.
+    Then normalized reward is:
+      rew_norm = rew / sqrt(ret_var + eps)
+- training flag:
+    If self.training is True → we update the statistics.
+    For evaluation, you could set training = False to use frozen stats.
+
+IN DETAIL
+---------
+1) __init__(env, norm_obs, norm_rew, clip_obs, clip_rew, gamma, eps):
+   - Assert that env.observation_space is Box, because we expect a flat vector.
+   - Save flags:
+       self.norm_obs = norm_obs
+       self.norm_rew = norm_rew
+       self.clip_obs = clip_obs
+       self.clip_rew = clip_rew
+       self.gamma    = gamma
+       self.eps      = eps
+
+   - obs_space = env.observation_space.shape
+     Example: if obs is a 25-dim vector, shape = (25,)
+
+   - self.obs_rms = RunningMeanStd(shape=obs_space)
+     For observation normalization.
+
+   - self.ret_rms = RunningMeanStd(shape=())
+     For return normalization (scalar).
+
+   - self.training = True
+   - self._ret = 0.0
+     This is the discounted return accumulator (running return).
+
+   - self._raw_ep_return = 0.0
+     This accumulates the *raw* (unnormalized) episode return for logging.
+
+2) _normalize_obs(self, obs):
+   - If norm_obs is False or obs is None: just return obs as is.
+   - If training:
+       self.obs_rms.update(obs)
+   - Compute std = sqrt(self.obs_rms.var + eps)
+   - Normalize:
+       obs_norm = (obs - mean) / std
+   - Clip:
+       obs_clipped = clip(obs_norm, -clip_obs, clip_obs)
+   - Return obs_clipped.astype(float32)
+
+3) _normalize_rew(self, rew):
+   - If norm_rew is False: return rew as is.
+
+   - Update the running discounted return:
+       self._ret = self._ret * gamma + rew
+
+   - If training:
+       self.ret_rms.update(self._ret)
+
+   - Compute std = sqrt(self.ret_rms.var + eps)
+   - rew_norm = rew / std
+   - Clip:
+       rew_clipped = clip(rew_norm, -clip_rew, clip_rew)
+   - Return rew_clipped.astype(float32)
+
+4) reset(self, **kwargs):
+   - obs = self.env.reset(**kwargs)
+   - self._ret = 0.0
+   - self._raw_ep_return = 0.0
+   - Return self._normalize_obs(obs)
+
+5) step(self, action):
+   - Call underlying env:
+       obs, rew, done, info = self.env.step(action)
+
+   - raw_rew = float(rew)
+   - self._raw_ep_return += raw_rew
+
+   - obs = self._normalize_obs(obs)
+   - rew = self._normalize_rew(raw_rew)
+
+   - info['raw_reward'] = raw_rew
+
+   - If done:
+       self._ret = 0.0
+       info['raw_ep_return'] = self._raw_ep_return
+       self._raw_ep_return = 0.0
+
+   - Return obs, rew, done, info
+
+6) denormalize_obs(self, obs):
+   - Undo the normalization using current mean/var:
+       std = sqrt(obs_rms.var + eps)
+       return obs * std + mean
+
+7) denormalize_rew(self, rew):
+   - Undo reward normalization using ret_rms:
+       std = sqrt(ret_rms.var + eps)
+       return rew * std
+
+8) save(path) / load(path):
+   - Save / load the statistics and parameters to/from JSON.
+   - This allows you to:
+       - Train with normalization,
+       - Save env stats,
+       - Later evaluate the agent using the same normalization parameters.
+
+END RESULT
+----------
+The RL algorithm:
+  - Sees normalized observations and rewards during training.
+  - Info dict contains:
+       'raw_reward'    : original reward each step,
+       'raw_ep_return' : original total return at episode end.
+  - You can freeze stats and use them for clean evaluation.
+
+============================================================
+6. make_env(environment_arguments)
+============================================================
+
+WHAT IT DOES OVERALL
+--------------------
+This function constructs the full environment with all wrappers.
+
+STEPS
+-----
+1) Extract arguments:
+   - env_args = {
+       'mode': environment_arguments['mode'],
+       'seed': environment_arguments['seed'],
+       'random_weather': environment_arguments['random_weather'],
+     }
+   - env_id = environment_arguments['env_id']
+   - max_episode_steps = environment_arguments['max_episode_steps']
+
+2) base_env = gym.make(env_id, **env_args)
+   This creates the base GymDssatPdi-v0 environment.
+
+3) time_limit = TimeLimit(base_env, max_episode_steps=max_episode_steps)
+   Adds an upper bound on the number of steps per episode.
+   If the episode reaches max_episode_steps, done=True is returned.
+
+4) dict_to_array = DictToArrayWrapper(time_limit)
+   Converts dict observations into 1D float32 vectors.
+
+5) reward_tuple_adapter = RewardTupleAdapter(dict_to_array)
+   Splits (main, leach) reward into:
+     - rew = main   (for training)
+     - info['leach'] = leach
+   Also accumulates episode metrics (N_total, W_total, leach_total, yield).
+
+6) action_to_dict = ActionToDictWrapper(reward_tuple_adapter)
+   Converts Discrete(25) actions from the agent into:
+     {"anfer": ..., "amir": ...}
+
+7) env = NormalizationWrapper(
+         action_to_dict,
+         norm_obs=True,
+         norm_rew=True,
+         clip_obs=10.0,
+         clip_rew=10.0,
+         gamma=0.99,
+         eps=1e-8,
+       )
+   Adds observation and reward normalization on top.
+
+8) return env
+
+END RESULT
+----------
+The final environment returned by make_env(...) is ready to plug into
+RL libraries. It:
+
+- Accepts Discrete(25) actions.
+- Delivers flattened, normalized observations.
+- Delivers normalized main rewards, and logs:
+    - raw_reward each step.
+    - raw_ep_return at episode end.
+    - leach and episode_metrics via RewardTupleAdapter.
+
+============================================================

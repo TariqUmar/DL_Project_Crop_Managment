@@ -1,0 +1,52 @@
+Experiment 1:
+Network = 25 -> 256 -> 256 -> 256 -> 25
+Population size = 200
+Iterations  = 50
+Sigma = 0.5
+seed = 123, for algo, network, env
+weights = "w1":1.0, "w2":0.3, "w3":1.2, "w4":0.3
+
+
+Experiment 2:
+Network = 25 -> 256 -> 256 -> 256 -> 25
+Population size = 200
+Iterations  = 50
+Sigma = 0.5
+seed = 123, only for env
+weights = "w1":1.0, "w2":0.3, "w3":1.2, "w4":0.3
+
+
+Experiment 3:
+Network = 25 -> 256 -> 256 -> 256 -> 25
+Population size = 200
+Sigma = 0.5
+seed = 123, only for env
+weights = "w1":1.0, "w2":0.4, "w3":0.0, "w4":1.0
+
+-----------------------------------------------------------------------------
+
+Experiment 4:
+Network = 25 -> 256 -> 256 -> 256 -> 25
+Population size = 200
+Sigma = 0.5
+seed = 123, only for env
+weights = "w1":1.0, "w2":2.0, "w3":0.0, "w4":2.0
+Removed the reward normalization.
+
+
+Experiment 5:
+Network = 25 -> 256 -> 256 -> 256 -> 25
+Population size = 200
+Sigma = 0.5
+seed = 123, only for env
+weights = "w1":1.0, "w2":0.3, "w3":1.2, "w4":0.3
+Removed the reward normalization.
+
+
+Experiment 6:
+Network = 25 -> 256 -> 256 -> 256 -> 25
+Population size = 200
+Sigma = 0.5
+seed = 123, only for env
+weights = "w1":1.0, "w2":0.0, "w3":0.0, "w4":0.0
+Removed the reward normalization.
