@@ -5,8 +5,7 @@ A comprehensive deep learning project for optimizing crop management strategies 
 ## Table of Contents
 
 - [Overview](#overview)
-- [Project Structure](#project-structure)
-- [Algorithms Implemented](#algorithms-implemented)
+- [Repository Structure](#repository-structure)
 - [Environment](#environment)
 - [Installation](#installation)
 - [Usage](#usage)
